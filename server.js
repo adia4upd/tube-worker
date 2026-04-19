@@ -121,14 +121,41 @@ async function jobConcat(jobId, job) {
       cleanup(tmpPath);
       localClips.push(clipPath);
     } else if (clip.imageUrl) {
-      // 이미지 → 정지 영상 변환
+      // 이미지 → 영상 변환 (Ken Burns 효과 포함)
       const tmpPath = await download(clip.imageUrl, 'jpg');
       const duration = clip.duration || 5;
+      const fps = 25;
+      const frames = Math.round(duration * fps);
+
+      let kenFilter;
+      switch (clip.kenBurns) {
+        case 'zoom-in':
+          kenFilter = `zoompan=z='min(zoom+${(0.12/frames).toFixed(6)},1.12)':d=${frames}:s=${outW}x${outH}:fps=${fps}`;
+          break;
+        case 'zoom-out':
+          kenFilter = `zoompan=z='if(eq(on\\,1)\\,1.12\\,max(zoom-${(0.12/frames).toFixed(6)}\\,1.0))':d=${frames}:s=${outW}x${outH}:fps=${fps}`;
+          break;
+        case 'ken-burns':
+          kenFilter = `zoompan=z='min(zoom+${(0.15/frames).toFixed(6)},1.15)':x='iw/2-(iw/zoom/2)+on*(iw*0.02/${frames})':y='ih/2-(ih/zoom/2)':d=${frames}:s=${outW}x${outH}:fps=${fps}`;
+          break;
+        case 'pan-left':
+          kenFilter = `zoompan=z=1.08:x='iw/2-(iw/zoom/2)+on*(iw*0.06/${frames})':y='ih/2-(ih/zoom/2)':d=${frames}:s=${outW}x${outH}:fps=${fps}`;
+          break;
+        case 'pan-right':
+          kenFilter = `zoompan=z=1.08:x='iw/2-(iw/zoom/2)-on*(iw*0.06/${frames})':y='ih/2-(ih/zoom/2)':d=${frames}:s=${outW}x${outH}:fps=${fps}`;
+          break;
+        default:
+          kenFilter = scaleFilter;
+      }
+      const vf = clip.kenBurns && clip.kenBurns !== 'none'
+        ? `scale=${outW*2}:${outH*2},${kenFilter},setsar=1`
+        : scaleFilter;
+
       await new Promise((resolve, reject) => {
         ffmpeg()
           .input(tmpPath)
           .inputOptions(['-loop 1'])
-          .outputOptions([`-t ${duration}`, '-c:v libx264', '-pix_fmt yuv420p', '-r 25', `-vf ${scaleFilter}`])
+          .outputOptions([`-t ${duration}`, '-c:v libx264', '-pix_fmt yuv420p', `-r ${fps}`, `-vf ${vf}`])
           .output(clipPath)
           .on('end', resolve)
           .on('error', reject)
