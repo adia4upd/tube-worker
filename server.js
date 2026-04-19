@@ -218,6 +218,24 @@ async function jobConcat(jobId, job) {
     outputPath = finalPath;
   }
 
+  // 자막 번인 (ASS 형식)
+  if (job.subtitleContent) {
+    jobs[jobId].progress = '자막 합성 중';
+    const assPath = path.join(TMP_DIR, `${jobId}.ass`);
+    fs.writeFileSync(assPath, job.subtitleContent, 'utf8');
+    const subbedPath = path.join(TMP_DIR, `${jobId}_subbed.mp4`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(outputPath)
+        .outputOptions([`-vf ass=${assPath}`, '-c:a copy'])
+        .output(subbedPath)
+        .on('end', resolve)
+        .on('error', (err) => { cleanup(assPath); reject(err); })
+        .run();
+    });
+    cleanup(assPath, outputPath);
+    outputPath = subbedPath;
+  }
+
   // 결과 파일 경로 저장 (다운로드 엔드포인트에서 제공)
   jobs[jobId].resultFile = outputPath;
   return `${SERVER_BASE_URL}/jobs/${jobId}/result`;
