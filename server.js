@@ -108,11 +108,14 @@ async function jobConcat(jobId, job) {
     const clipPath = path.join(TMP_DIR, `${jobId}_clip${i}.mp4`);
 
     if (clip.videoUrl) {
-      // 영상 다운로드 → 나레이션 길이에 맞게 트림 후 재인코딩
+      // 영상 다운로드 → 나레이션 길이에 맞게 트림/루프 후 재인코딩
       const tmpPath = await download(clip.videoUrl, 'mp4');
       const clipDuration = clip.duration || 5;
       await new Promise((resolve, reject) => {
-        ffmpeg(tmpPath)
+        const cmd = clip.loop
+          ? ffmpeg(tmpPath).inputOptions(['-stream_loop -1'])
+          : ffmpeg(tmpPath);
+        cmd
           .outputOptions([`-t ${clipDuration}`, '-c:v libx264', '-an', '-pix_fmt yuv420p', '-r 25', `-vf ${scaleFilter}`])
           .output(clipPath)
           .on('end', resolve)
