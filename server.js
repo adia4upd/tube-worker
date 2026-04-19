@@ -115,6 +115,9 @@ async function jobConcat(jobId, job) {
         const cmd = clip.loop
           ? ffmpeg(tmpPath).inputOptions(['-stream_loop -1'])
           : ffmpeg(tmpPath);
+        if (clip.startTime && clip.startTime > 0) {
+          cmd.inputOptions([`-ss ${clip.startTime}`]);
+        }
         cmd
           .outputOptions([`-t ${clipDuration}`, '-c:v libx264', '-an', '-pix_fmt yuv420p', '-r 25', `-vf ${scaleFilter}`])
           .output(clipPath)
