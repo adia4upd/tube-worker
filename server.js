@@ -12,6 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL || 'https://tube-worker-production.up.railway.app';
 
 // 임시 파일 디렉토리
 const TMP_DIR = path.join(os.tmpdir(), 'tube-worker');
@@ -67,9 +68,8 @@ async function processJob(jobId, job) {
 }
 
 // ── 작업 1: 영상 + 음성 합성 ─────────────────────────────────────
-// videoUrl: mp4/webm, audioUrl: mp3/wav, outputUrl: 업로드할 곳 (Firebase Storage signed URL)
 async function jobMerge(jobId, job) {
-  const { videoUrl, audioUrl, uploadUrl } = job;
+  const { videoUrl, audioUrl } = job;
 
   const videoPath = await download(videoUrl, 'mp4');
   const audioPath = await download(audioUrl, 'mp3');
@@ -79,69 +79,73 @@ async function jobMerge(jobId, job) {
     ffmpeg()
       .input(videoPath)
       .input(audioPath)
-      .outputOptions([
-        '-c:v copy',      // 영상 재인코딩 없이 복사 (빠름)
-        '-c:a aac',       // 오디오 AAC 인코딩
-        '-map 0:v:0',     // 첫 번째 입력의 비디오
-        '-map 1:a:0',     // 두 번째 입력의 오디오
-        '-shortest',      // 짧은 쪽에 맞춤
-      ])
+      .outputOptions(['-c:v copy', '-c:a aac', '-map 0:v:0', '-map 1:a:0', '-shortest'])
       .output(outputPath)
       .on('end', resolve)
       .on('error', reject)
       .run();
   });
 
-  // Firebase Storage signed URL로 업로드
-  const resultUrl = await uploadToSignedUrl(outputPath, uploadUrl);
-  cleanup(videoPath, audioPath, outputPath);
-  return resultUrl;
+  cleanup(videoPath, audioPath);
+  jobs[jobId].resultFile = outputPath;
+  return `${SERVER_BASE_URL}/jobs/${jobId}/result`;
 }
 
-// ── 작업 2: 여러 영상 클립 이어붙이기 ────────────────────────────
-// clips: [{ videoUrl, audioUrl, duration }], uploadUrl
+// ── 작업 2: 여러 영상/이미지 클립 이어붙이기 + 나레이션 합성 ──────
+// clips: [{ videoUrl?, imageUrl?, duration? }], audioUrl (전체 나레이션), ratio
 async function jobConcat(jobId, job) {
-  const { clips, uploadUrl } = job;
+  const { clips, audioUrl, ratio } = job;
+
+  // 출력 해상도
+  const [outW, outH] = ratio === '9:16' ? [1080, 1920] : ratio === '1:1' ? [1080, 1080] : [1920, 1080];
+  const scaleFilter = `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
 
   const localClips = [];
-  const concatListPath = path.join(TMP_DIR, `${jobId}_list.txt`);
 
-  // 각 클립 다운로드 + 필요시 오디오 합성
   for (let i = 0; i < clips.length; i++) {
     const clip = clips[i];
-    jobs[jobId].progress = `클립 ${i + 1}/${clips.length} 다운로드 중`;
+    jobs[jobId].progress = `클립 ${i + 1}/${clips.length} 처리 중`;
+    const clipPath = path.join(TMP_DIR, `${jobId}_clip${i}.mp4`);
 
-    if (clip.videoUrl && clip.audioUrl) {
-      // 영상+음성 합성 후 사용
-      const videoPath = await download(clip.videoUrl, 'mp4');
-      const audioPath = await download(clip.audioUrl, 'mp3');
-      const mergedPath = path.join(TMP_DIR, `${jobId}_clip${i}.mp4`);
-
+    if (clip.videoUrl) {
+      // 영상 다운로드 → 통일된 포맷으로 재인코딩
+      const tmpPath = await download(clip.videoUrl, 'mp4');
       await new Promise((resolve, reject) => {
-        ffmpeg()
-          .input(videoPath)
-          .input(audioPath)
-          .outputOptions(['-c:v copy', '-c:a aac', '-map 0:v:0', '-map 1:a:0', '-shortest'])
-          .output(mergedPath)
+        ffmpeg(tmpPath)
+          .outputOptions(['-c:v libx264', '-an', '-pix_fmt yuv420p', '-r 25', `-vf ${scaleFilter}`])
+          .output(clipPath)
           .on('end', resolve)
           .on('error', reject)
           .run();
       });
-
-      cleanup(videoPath, audioPath);
-      localClips.push(mergedPath);
-    } else if (clip.videoUrl) {
-      const videoPath = await download(clip.videoUrl, 'mp4');
-      localClips.push(videoPath);
+      cleanup(tmpPath);
+      localClips.push(clipPath);
+    } else if (clip.imageUrl) {
+      // 이미지 → 정지 영상 변환
+      const tmpPath = await download(clip.imageUrl, 'jpg');
+      const duration = clip.duration || 5;
+      await new Promise((resolve, reject) => {
+        ffmpeg()
+          .input(tmpPath)
+          .inputOptions(['-loop 1'])
+          .outputOptions([`-t ${duration}`, '-c:v libx264', '-pix_fmt yuv420p', '-r 25', `-vf ${scaleFilter}`])
+          .output(clipPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run();
+      });
+      cleanup(tmpPath);
+      localClips.push(clipPath);
     }
   }
 
-  // concat 리스트 파일 생성
-  const listContent = localClips.map(p => `file '${p}'`).join('\n');
-  fs.writeFileSync(concatListPath, listContent);
+  if (localClips.length === 0) throw new Error('처리할 클립이 없습니다');
 
-  // 이어붙이기
-  const outputPath = path.join(TMP_DIR, `${jobId}_final.mp4`);
+  // 클립 이어붙이기
+  const concatListPath = path.join(TMP_DIR, `${jobId}_list.txt`);
+  fs.writeFileSync(concatListPath, localClips.map(p => `file '${p}'`).join('\n'));
+
+  const concatPath = path.join(TMP_DIR, `${jobId}_concat.mp4`);
   jobs[jobId].progress = '영상 합치는 중';
 
   await new Promise((resolve, reject) => {
@@ -149,39 +153,39 @@ async function jobConcat(jobId, job) {
       .input(concatListPath)
       .inputOptions(['-f concat', '-safe 0'])
       .outputOptions(['-c copy'])
-      .output(outputPath)
+      .output(concatPath)
       .on('end', resolve)
       .on('error', reject)
       .run();
   });
 
-  const resultUrl = await uploadToSignedUrl(outputPath, uploadUrl);
-  cleanup(concatListPath, outputPath, ...localClips);
-  return resultUrl;
-}
+  cleanup(concatListPath, ...localClips);
 
-// ── Firebase Storage signed URL로 파일 업로드 ────────────────────
-async function uploadToSignedUrl(filePath, signedUrl) {
-  if (!signedUrl) {
-    // uploadUrl 없으면 로컬 파일을 base64로 반환 (테스트용)
-    const buf = fs.readFileSync(filePath);
-    return `data:video/mp4;base64,${buf.toString('base64').substring(0, 100)}...(truncated)`;
+  // 전체 나레이션 합성
+  let outputPath = concatPath;
+  if (audioUrl) {
+    jobs[jobId].progress = '나레이션 합성 중';
+    const audioPath = await download(audioUrl, 'mp3');
+    const finalPath = path.join(TMP_DIR, `${jobId}_final.mp4`);
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(concatPath)
+        .input(audioPath)
+        .outputOptions(['-c:v copy', '-c:a aac', '-map 0:v:0', '-map 1:a:0', '-shortest'])
+        .output(finalPath)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
+
+    cleanup(audioPath, concatPath);
+    outputPath = finalPath;
   }
 
-  const fileBuffer = fs.readFileSync(filePath);
-  await axios.put(signedUrl, fileBuffer, {
-    headers: { 'Content-Type': 'video/mp4' },
-    maxBodyLength: Infinity,
-    maxContentLength: Infinity,
-  });
-
-  // signed URL에서 다운로드 가능한 URL 추출 (Firebase 형식)
-  const downloadUrl = signedUrl.split('?')[0].replace(
-    'storage.googleapis.com/',
-    'firebasestorage.googleapis.com/v0/b/'
-  ).replace('/o/', '/o/') + '?alt=media';
-
-  return downloadUrl;
+  // 결과 파일 경로 저장 (다운로드 엔드포인트에서 제공)
+  jobs[jobId].resultFile = outputPath;
+  return `${SERVER_BASE_URL}/jobs/${jobId}/result`;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -218,6 +222,19 @@ app.get('/jobs/:jobId', (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.status(404).json({ error: '작업을 찾을 수 없음' });
   res.json(job);
+});
+
+// 결과 파일 다운로드
+app.get('/jobs/:jobId/result', (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.status(404).json({ error: '작업을 찾을 수 없음' });
+  if (job.status !== 'done' || !job.resultFile) return res.status(404).json({ error: '결과 없음' });
+  if (!fs.existsSync(job.resultFile)) return res.status(410).json({ error: '파일 만료됨' });
+
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', 'attachment; filename="merged_video.mp4"');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  fs.createReadStream(job.resultFile).pipe(res);
 });
 
 // 완료된 작업 정리 (1시간 이상 된 것)
