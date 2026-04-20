@@ -11,6 +11,52 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ── Firebase Admin 초기화 ─────────────────────────────────────────
+let firebaseAdmin = null;
+let firebaseBucket = null;
+
+function getFirebaseBucket() {
+  if (firebaseBucket) return firebaseBucket;
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
+  const bucketName = process.env.FIREBASE_STORAGE_BUCKET || 'dodo-tube-factory.firebasestorage.app';
+  if (!serviceAccountJson) return null;
+  try {
+    const admin = require('firebase-admin');
+    if (!firebaseAdmin) {
+      const serviceAccount = JSON.parse(serviceAccountJson);
+      firebaseAdmin = admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+        storageBucket: bucketName,
+      });
+    }
+    firebaseBucket = admin.storage().bucket();
+    return firebaseBucket;
+  } catch (e) {
+    console.warn('[Firebase] 초기화 실패:', e.message);
+    return null;
+  }
+}
+
+// ── Firebase Storage 업로드 → 영구 URL 반환 ──────────────────────
+async function uploadToFirebase(localPath, destPath) {
+  const bucket = getFirebaseBucket();
+  if (!bucket) return null;
+  try {
+    await bucket.upload(localPath, {
+      destination: destPath,
+      metadata: { contentType: 'video/mp4' },
+    });
+    const [url] = await bucket.file(destPath).getSignedUrl({
+      action: 'read',
+      expires: '2099-01-01', // 사실상 영구
+    });
+    return url;
+  } catch (e) {
+    console.warn('[Firebase] 업로드 실패:', e.message);
+    return null;
+  }
+}
+
 const PORT = process.env.PORT || 3001;
 const SERVER_BASE_URL = process.env.SERVER_BASE_URL || 'https://tube-worker-production.up.railway.app';
 
@@ -320,20 +366,31 @@ async function jobAutoPipeline(jobId, job) {
   cleanup(assPath, narPath);
 
   jobs[jobId].resultFile = finalPath;
-  const resultUrl = `${SERVER_BASE_URL}/jobs/${jobId}/result`;
+  const railwayUrl = `${SERVER_BASE_URL}/jobs/${jobId}/result`;
+
+  // ── Firebase Storage 업로드 (영구 보관) ────────────────────────
+  progress('Firebase 업로드 중...');
+  const destPath = `auto-pipeline/${jobId}/final.mp4`;
+  const firebaseUrl = await uploadToFirebase(finalPath, destPath);
+
+  const downloadUrl = firebaseUrl || railwayUrl;
+  const urlNote = firebaseUrl
+    ? '☁️ Firebase에 영구 저장됨'
+    : '⏳ 임시 링크 (1시간 유효)';
 
   // ── 텔레그램으로 완성 영상 전송 ────────────────────────────────
   await sendTg(chatId,
     `✅ <b>영상 제작 완료!</b>\n\n` +
     `📹 씬 수: ${validScenes.length}개\n` +
-    `🔗 다운로드 링크 (1시간 유효):\n${resultUrl}\n\n` +
-    `<i>영상이 너무 크면 링크에서 직접 다운로드해주세요.</i>`
+    `${urlNote}\n` +
+    `🔗 <a href="${downloadUrl}">영상 다운로드</a>\n\n` +
+    `<i>아래에서 영상을 바로 확인하세요 👇</i>`
   );
 
-  // 텔레그램 sendVideo 시도 (50MB 미만 숏폼)
-  await sendTgVideo(chatId, resultUrl, '🎬 자동 제작 완성 영상');
+  // 텔레그램에 영상 파일 직접 전송
+  await sendTgVideo(chatId, downloadUrl, `🎬 자동 제작 완성 영상 (씬 ${validScenes.length}개)`);
 
-  return resultUrl;
+  return downloadUrl;
 }
 
 // ── 작업 1: 영상 + 음성 합성 ─────────────────────────────────────
