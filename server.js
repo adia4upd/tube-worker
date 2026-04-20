@@ -177,6 +177,7 @@ async function jobAutoPipeline(jobId, job) {
   const {
     youtubeUrl, chatId,
     format = 'shortform', duration = '60sec', style = 'realistic',
+    scriptGuideline = null, guidelineTitle = null,
   } = job;
 
   const BASE = process.env.VERCEL_BASE_URL || 'https://dodo-tube-factory.vercel.app';
@@ -205,7 +206,10 @@ async function jobAutoPipeline(jobId, job) {
 
   // ── Step 2: 스토리보드(대본+씬) 생성 ─────────────────────────
   progress('2/5 대본+씬 생성 중...');
-  await sendTg(chatId, `📝 <b>Step 2/5</b> 대본과 씬을 구성 중...\n(${transcript.length}자 분석)`);
+  await sendTg(chatId,
+    `📝 <b>Step 2/5</b> 대본과 씬을 구성 중...\n(${transcript.length}자 분석)` +
+    (guidelineTitle ? `\n📋 지침: ${guidelineTitle}` : '')
+  );
 
   const sbRes = await axios.post(`${BASE}/api/generate-storyboard`, {
     topic: `[레퍼럴 재창작] ${transcript.slice(0, 600)}`,
@@ -213,6 +217,7 @@ async function jobAutoPipeline(jobId, job) {
     guideline: `영상 길이: ${durationMin}분 / 포맷: ${format === 'shortform' ? '숏폼' : '롱폼'}`,
     format: format === 'shortform' ? 'shorts' : 'longform',
     style,
+    scriptGuideline, // 대본 지침 (야담용, 바이럴용 등)
   }, { timeout: 120000 });
 
   const scenes = sbRes.data?.scenes;
