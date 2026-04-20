@@ -172,58 +172,92 @@ async function processJob(jobId, job) {
   }
 }
 
+// ── ffprobe로 오디오 실제 길이 측정 ──────────────────────────────
+function getAudioDuration(filePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, meta) => {
+      if (err) reject(err);
+      else resolve(parseFloat(meta.format.duration) || 0);
+    });
+  });
+}
+
+// ── 씬 수 하드 제한 테이블 ────────────────────────────────────────
+const DURATION_CONFIG = {
+  '30sec': { maxScenes: 5,  durationMin: '0.5', targetSec: 30  },
+  '60sec': { maxScenes: 7,  durationMin: '1',   targetSec: 60  },
+  '2min':  { maxScenes: 12, durationMin: '2',   targetSec: 120 },
+  '3min':  { maxScenes: 15, durationMin: '3',   targetSec: 180 },
+};
+
 // ── 작업 0: 자동 파이프라인 (YouTube → 완성 영상) ──────────────────
 async function jobAutoPipeline(jobId, job) {
   const {
-    youtubeUrl, chatId,
+    youtubeUrl, topic, chatId,
     format = 'shortform', duration = '60sec', style = 'realistic',
     scriptGuideline = null, guidelineTitle = null,
   } = job;
 
   const BASE = process.env.VERCEL_BASE_URL || 'https://dodo-tube-factory.vercel.app';
   const ratio = format === 'shortform' ? '9:16' : '16:9';
-  const durationMin = duration === '30sec' ? '0.5' : duration === '3min' ? '3' : '1';
+  const cfg = DURATION_CONFIG[duration] || DURATION_CONFIG['60sec'];
 
   const progress = (msg) => { jobs[jobId].progress = msg; console.log(`[${jobId}]`, msg); };
 
-  // ── Step 1: YouTube 자막 추출 ──────────────────────────────────
-  progress('1/5 YouTube 자막 추출 중...');
-  await sendTg(chatId, '🎬 영상 자동 제작을 시작합니다!\n\n📥 <b>Step 1/5</b> YouTube 자막 추출 중...');
+  // ── Step 1: 소스 확보 (YouTube 자막 or 직접 주제) ──────────────
+  progress('1/5 소스 분석 중...');
 
-  const { YoutubeTranscript } = require('youtube-transcript');
-  const vidMatch = youtubeUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
-  if (!vidMatch) throw new Error('YouTube URL에서 영상 ID를 찾을 수 없습니다.');
-  const videoId = vidMatch[1];
+  let sourceText = '';
+  let sourceLabel = '';
 
-  let transcript = '';
-  try {
-    const items = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'ko' })
-      .catch(() => YoutubeTranscript.fetchTranscript(videoId)); // 한국어 없으면 기본
-    transcript = items.map(i => i.text).join(' ').slice(0, 4000);
-  } catch (e) {
-    throw new Error(`자막 추출 실패: ${e.message}\n자막이 활성화된 영상인지 확인해주세요.`);
+  if (youtubeUrl) {
+    await sendTg(chatId, '🎬 영상 자동 제작을 시작합니다!\n\n📥 <b>Step 1/5</b> YouTube 자막 추출 중...');
+    const { YoutubeTranscript } = require('youtube-transcript');
+    const vidMatch = youtubeUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
+    if (!vidMatch) throw new Error('YouTube URL에서 영상 ID를 찾을 수 없습니다.');
+    const videoId = vidMatch[1];
+    try {
+      const items = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'ko' })
+        .catch(() => YoutubeTranscript.fetchTranscript(videoId));
+      sourceText = `[레퍼럴 재창작] ${items.map(i => i.text).join(' ').slice(0, 600)}`;
+      sourceLabel = `YouTube/${videoId}`;
+    } catch (e) {
+      throw new Error(`자막 추출 실패: ${e.message}`);
+    }
+  } else if (topic) {
+    await sendTg(chatId, `🎬 영상 자동 제작을 시작합니다!\n\n📝 주제: <b>${topic}</b>`);
+    sourceText = topic;
+    sourceLabel = topic.slice(0, 40);
+  } else {
+    throw new Error('youtubeUrl 또는 topic이 필요합니다.');
   }
 
-  // ── Step 2: 스토리보드(대본+씬) 생성 ─────────────────────────
+  // ── Step 2: 스토리보드 생성 (씬 수 하드 제한 적용) ────────────
   progress('2/5 대본+씬 생성 중...');
   await sendTg(chatId,
-    `📝 <b>Step 2/5</b> 대본과 씬을 구성 중...\n(${transcript.length}자 분석)` +
+    `📝 <b>Step 2/5</b> ${cfg.maxScenes}개 씬 대본 구성 중...` +
     (guidelineTitle ? `\n📋 지침: ${guidelineTitle}` : '')
   );
 
   const sbRes = await axios.post(`${BASE}/api/generate-storyboard`, {
-    topic: `[레퍼럴 재창작] ${transcript.slice(0, 600)}`,
-    refVideoTitle: `YouTube/${videoId}`,
-    guideline: `영상 길이: ${durationMin}분 / 포맷: ${format === 'shortform' ? '숏폼' : '롱폼'}`,
+    topic: sourceText,
+    refVideoTitle: sourceLabel,
+    guideline: `영상 길이: ${cfg.durationMin}분 / 씬 수: 정확히 ${cfg.maxScenes}개 / 포맷: ${format === 'shortform' ? '숏폼' : '롱폼'} / 씬당 대사는 짧고 임팩트 있게`,
     format: format === 'shortform' ? 'shorts' : 'longform',
     style,
-    scriptGuideline, // 대본 지침 (야담용, 바이럴용 등)
+    scriptGuideline,
   }, { timeout: 120000 });
 
-  const scenes = sbRes.data?.scenes;
+  let scenes = sbRes.data?.scenes;
   if (!scenes?.length) throw new Error('씬 생성 실패 — 스토리보드 API 응답 없음');
 
-  // ── Step 3: 씬 이미지 프롬프트 생성 ───────────────────────────
+  // 씬 수 초과 시 강제 절삭
+  if (scenes.length > cfg.maxScenes) {
+    console.warn(`[${jobId}] 씬 수 초과 (${scenes.length} → ${cfg.maxScenes}개로 절삭)`);
+    scenes = scenes.slice(0, cfg.maxScenes);
+  }
+
+  // ── Step 3: 이미지 프롬프트 생성 ──────────────────────────────
   progress('3/5 이미지 프롬프트 생성 중...');
   let promptedScenes = scenes;
   try {
@@ -235,11 +269,13 @@ async function jobAutoPipeline(jobId, job) {
     console.warn(`[${jobId}] 프롬프트 생성 실패, 원본 씬 사용:`, e.message);
   }
 
-  // ── Step 4: 이미지 병렬 생성 + TTS 동시 처리 ─────────────────
-  progress('4/5 이미지 + 나레이션 생성 중...');
-  await sendTg(chatId, `🖼️ <b>Step 4/5</b> ${promptedScenes.length}개 씬 이미지 + 나레이션 생성 중...`);
+  // ── Step 4: TTS 먼저 생성 → 실제 오디오 길이 확정 ────────────
+  // 이미지는 TTS와 병렬로 생성 (속도 유지)
+  progress('4/5 나레이션 생성 + 이미지 병렬 생성 중...');
+  await sendTg(chatId, `🎙️ <b>Step 4/5</b> 나레이션 + ${promptedScenes.length}개 이미지 생성 중...`);
 
   const fullScript = promptedScenes.map(s => s.scriptText || s.narration || '').join(' ');
+  const audioPath = path.join(TMP_DIR, `${jobId}_audio.mp3`);
 
   const [imageResults, ttsBuffer] = await Promise.all([
     // 이미지 병렬 생성
@@ -264,47 +300,52 @@ async function jobAutoPipeline(jobId, job) {
       }
     })),
 
-    // TTS 병렬 생성
+    // TTS 생성
     axios.post(`${BASE}/api/tts`, {
-      text: fullScript,
-      engine: 'ElevenLabs',
-      voiceId: '21m00Tcm4TlvDq8ikWAM', // Rachel
+      text: fullScript, engine: 'ElevenLabs', voiceId: '21m00Tcm4TlvDq8ikWAM',
     }, { responseType: 'arraybuffer', timeout: 120000 })
       .then(r => Buffer.from(r.data))
       .catch(async (e) => {
         console.warn(`[${jobId}] ElevenLabs 실패, Google TTS 시도:`, e.message);
         const r = await axios.post(`${BASE}/api/tts`, {
-          text: fullScript,
-          engine: 'GoogleTTS',
-          voiceId: 'ko-KR-Wavenet-A',
+          text: fullScript, engine: 'GoogleTTS', voiceId: 'ko-KR-Wavenet-A',
         }, { responseType: 'arraybuffer', timeout: 60000 });
         return Buffer.from(r.data);
       }),
   ]);
 
-  // 로컬 파일 저장
-  const audioPath = path.join(TMP_DIR, `${jobId}_audio.mp3`);
+  // TTS 저장 후 실제 오디오 길이 측정
   fs.writeFileSync(audioPath, ttsBuffer);
+  const actualAudioSec = await getAudioDuration(audioPath);
+  console.log(`[${jobId}] 실제 오디오 길이: ${actualAudioSec.toFixed(2)}초`);
 
-  const validScenes = imageResults.filter(s => s.localPath);
+  // 씬별 길이 = 실제 오디오 길이를 텍스트 비율로 분배
+  const totalTextLen = promptedScenes.reduce((sum, s) => sum + (s.scriptText || s.narration || '').length, 0);
+  const scenesWithDuration = promptedScenes.map(s => {
+    const textLen = (s.scriptText || s.narration || '').length || 1;
+    const ratio_t = totalTextLen > 0 ? textLen / totalTextLen : 1 / promptedScenes.length;
+    const dur = Math.max(2, parseFloat((actualAudioSec * ratio_t).toFixed(2)));
+    return { ...s, calculatedDuration: dur };
+  });
+
+  const validScenes = imageResults
+    .map((r, i) => ({ ...scenesWithDuration[i], localPath: r.localPath }))
+    .filter(s => s.localPath);
   if (!validScenes.length) throw new Error('이미지 생성 실패 — 사용 가능한 클립 없음');
 
-  // ── Step 5: FFmpeg 합성 ────────────────────────────────────────
+  // ── Step 5: FFmpeg 합성 (나레이션 길이 기준 씬 클립 생성) ──────
   progress('5/5 영상 합성 중...');
-  await sendTg(chatId, `🎬 <b>Step 5/5</b> ${validScenes.length}개 씬 영상 합성 중...\n(자막 포함)`);
+  await sendTg(chatId, `🎬 <b>Step 5/5</b> ${validScenes.length}개 씬 합성 중...\n⏱️ 총 오디오: ${actualAudioSec.toFixed(1)}초`);
 
   const [outW, outH] = ratio === '9:16' ? [1080, 1920] : [1920, 1080];
-  const scaleFilter = `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
 
-  // 각 씬 → 영상 클립
   const clipPaths = [];
   for (let i = 0; i < validScenes.length; i++) {
     const scene = validScenes[i];
-    const duration_s = scene.estimatedDuration || scene.duration || 5;
+    const duration_s = scene.calculatedDuration;
     const fps = 25;
     const frames = Math.round(duration_s * fps);
     const clipPath = path.join(TMP_DIR, `${jobId}_clip${i}.mp4`);
-
     const kenFilter = `zoompan=z='min(zoom+${(0.10 / frames).toFixed(6)},1.10)':d=${frames}:s=${outW}x${outH}:fps=${fps}`;
     const vf = `scale=${outW * 2}:${outH * 2},${kenFilter},setsar=1`;
 
@@ -354,8 +395,8 @@ async function jobAutoPipeline(jobId, job) {
   });
   cleanup(concatPath, audioPath);
 
-  // 자막 burn-in
-  const assContent = generateAss(validScenes, ratio);
+  // 자막 burn-in (calculatedDuration 기준)
+  const assContent = generateAss(validScenes.map(s => ({ ...s, estimatedDuration: s.calculatedDuration })), ratio);
   const assPath = path.join(TMP_DIR, `${jobId}.ass`);
   fs.writeFileSync(assPath, assContent, 'utf8');
   const finalPath = path.join(TMP_DIR, `${jobId}_final.mp4`);
@@ -373,27 +414,22 @@ async function jobAutoPipeline(jobId, job) {
   jobs[jobId].resultFile = finalPath;
   const railwayUrl = `${SERVER_BASE_URL}/jobs/${jobId}/result`;
 
-  // ── Firebase Storage 업로드 (영구 보관) ────────────────────────
   progress('Firebase 업로드 중...');
   const destPath = `auto-pipeline/${jobId}/final.mp4`;
   const firebaseUrl = await uploadToFirebase(finalPath, destPath);
 
   const downloadUrl = firebaseUrl || railwayUrl;
-  const urlNote = firebaseUrl
-    ? '☁️ Firebase에 영구 저장됨'
-    : '⏳ 임시 링크 (1시간 유효)';
+  const urlNote = firebaseUrl ? '☁️ Firebase에 영구 저장됨' : '⏳ 임시 링크 (1시간 유효)';
 
-  // ── 텔레그램으로 완성 영상 전송 ────────────────────────────────
   await sendTg(chatId,
     `✅ <b>영상 제작 완료!</b>\n\n` +
     `📹 씬 수: ${validScenes.length}개\n` +
+    `⏱️ 영상 길이: ${actualAudioSec.toFixed(1)}초\n` +
     `${urlNote}\n` +
     `🔗 <a href="${downloadUrl}">영상 다운로드</a>\n\n` +
     `<i>아래에서 영상을 바로 확인하세요 👇</i>`
   );
-
-  // 텔레그램에 영상 파일 직접 전송
-  await sendTgVideo(chatId, downloadUrl, `🎬 자동 제작 완성 영상 (씬 ${validScenes.length}개)`);
+  await sendTgVideo(chatId, downloadUrl, `🎬 자동 제작 완성 영상 (${actualAudioSec.toFixed(1)}초, ${validScenes.length}씬)`);
 
   return downloadUrl;
 }
