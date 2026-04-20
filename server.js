@@ -34,6 +34,63 @@ function cleanup(...files) {
   files.forEach(f => { try { if (f && fs.existsSync(f)) fs.unlinkSync(f); } catch {} });
 }
 
+// ── 텔레그램 메시지 전송 헬퍼 ────────────────────────────────────
+async function sendTg(chatId, text) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token || !chatId) return;
+  await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+    chat_id: chatId, text, parse_mode: 'HTML',
+  }).catch(e => console.warn('[tg] 메시지 실패:', e.message));
+}
+
+async function sendTgVideo(chatId, videoUrl, caption = '') {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token || !chatId) return;
+  await axios.post(`https://api.telegram.org/bot${token}/sendVideo`, {
+    chat_id: chatId, video: videoUrl, caption, parse_mode: 'HTML',
+  }).catch(e => console.warn('[tg] 비디오 전송 실패:', e.message));
+}
+
+// ── ASS 자막 생성 ─────────────────────────────────────────────────
+function generateAss(scenes, ratio) {
+  const isShort = ratio === '9:16';
+  const [playResX, playResY] = isShort ? [1080, 1920] : [1920, 1080];
+  const marginV = Math.round(playResY * 0.08);
+
+  const header = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${playResX}
+PlayResY: ${playResY}
+Collisions: Normal
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Noto Sans CJK KR,${isShort ? 52 : 44},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,40,40,${marginV},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+  const toAss = (sec) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    const cs = Math.round((sec % 1) * 100);
+    return `${String(h).padStart(1,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(cs).padStart(2,'0')}`;
+  };
+
+  let t = 0;
+  const events = scenes.map(scene => {
+    const dur = scene.estimatedDuration || scene.duration || 5;
+    const text = (scene.scriptText || scene.narration || '').replace(/\n/g, '\\N');
+    const line = `Dialogue: 0,${toAss(t)},${toAss(t + dur - 0.1)},Default,,0,0,0,,${text}`;
+    t += dur;
+    return line;
+  }).join('\n');
+
+  return header + events;
+}
+
 // ── 작업 처리기 ───────────────────────────────────────────────────
 async function processJob(jobId, job) {
   jobs[jobId] = { ...job, status: 'processing', startedAt: Date.now() };
@@ -46,6 +103,8 @@ async function processJob(jobId, job) {
       resultUrl = await jobMerge(jobId, job);
     } else if (job.type === 'concat') {
       resultUrl = await jobConcat(jobId, job);
+    } else if (job.type === 'auto-pipeline') {
+      resultUrl = await jobAutoPipeline(jobId, job);
     } else {
       throw new Error(`알 수 없는 작업 타입: ${job.type}`);
     }
@@ -65,6 +124,216 @@ async function processJob(jobId, job) {
       await axios.post(job.callbackUrl, { jobId, status: 'error', error: err.message }).catch(() => {});
     }
   }
+}
+
+// ── 작업 0: 자동 파이프라인 (YouTube → 완성 영상) ──────────────────
+async function jobAutoPipeline(jobId, job) {
+  const {
+    youtubeUrl, chatId,
+    format = 'shortform', duration = '60sec', style = 'realistic',
+  } = job;
+
+  const BASE = process.env.VERCEL_BASE_URL || 'https://dodo-tube-factory.vercel.app';
+  const ratio = format === 'shortform' ? '9:16' : '16:9';
+  const durationMin = duration === '30sec' ? '0.5' : duration === '3min' ? '3' : '1';
+
+  const progress = (msg) => { jobs[jobId].progress = msg; console.log(`[${jobId}]`, msg); };
+
+  // ── Step 1: YouTube 자막 추출 ──────────────────────────────────
+  progress('1/5 YouTube 자막 추출 중...');
+  await sendTg(chatId, '🎬 영상 자동 제작을 시작합니다!\n\n📥 <b>Step 1/5</b> YouTube 자막 추출 중...');
+
+  const { YoutubeTranscript } = require('youtube-transcript');
+  const vidMatch = youtubeUrl.match(/(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/);
+  if (!vidMatch) throw new Error('YouTube URL에서 영상 ID를 찾을 수 없습니다.');
+  const videoId = vidMatch[1];
+
+  let transcript = '';
+  try {
+    const items = await YoutubeTranscript.fetchTranscript(videoId, { lang: 'ko' })
+      .catch(() => YoutubeTranscript.fetchTranscript(videoId)); // 한국어 없으면 기본
+    transcript = items.map(i => i.text).join(' ').slice(0, 4000);
+  } catch (e) {
+    throw new Error(`자막 추출 실패: ${e.message}\n자막이 활성화된 영상인지 확인해주세요.`);
+  }
+
+  // ── Step 2: 스토리보드(대본+씬) 생성 ─────────────────────────
+  progress('2/5 대본+씬 생성 중...');
+  await sendTg(chatId, `📝 <b>Step 2/5</b> 대본과 씬을 구성 중...\n(${transcript.length}자 분석)`);
+
+  const sbRes = await axios.post(`${BASE}/api/generate-storyboard`, {
+    topic: `[레퍼럴 재창작] ${transcript.slice(0, 600)}`,
+    refVideoTitle: `YouTube/${videoId}`,
+    guideline: `영상 길이: ${durationMin}분 / 포맷: ${format === 'shortform' ? '숏폼' : '롱폼'}`,
+    format: format === 'shortform' ? 'shorts' : 'longform',
+    style,
+  }, { timeout: 120000 });
+
+  const scenes = sbRes.data?.scenes;
+  if (!scenes?.length) throw new Error('씬 생성 실패 — 스토리보드 API 응답 없음');
+
+  // ── Step 3: 씬 이미지 프롬프트 생성 ───────────────────────────
+  progress('3/5 이미지 프롬프트 생성 중...');
+  let promptedScenes = scenes;
+  try {
+    const prRes = await axios.post(`${BASE}/api/generate-scene-prompts`, {
+      scenes, style, format: format === 'shortform' ? 'shorts' : 'longform',
+    }, { timeout: 60000 });
+    promptedScenes = prRes.data?.scenes || scenes;
+  } catch (e) {
+    console.warn(`[${jobId}] 프롬프트 생성 실패, 원본 씬 사용:`, e.message);
+  }
+
+  // ── Step 4: 이미지 병렬 생성 + TTS 동시 처리 ─────────────────
+  progress('4/5 이미지 + 나레이션 생성 중...');
+  await sendTg(chatId, `🖼️ <b>Step 4/5</b> ${promptedScenes.length}개 씬 이미지 + 나레이션 생성 중...`);
+
+  const fullScript = promptedScenes.map(s => s.scriptText || s.narration || '').join(' ');
+
+  const [imageResults, ttsBuffer] = await Promise.all([
+    // 이미지 병렬 생성
+    Promise.all(promptedScenes.map(async (scene, i) => {
+      const prompt = scene.imagePrompt || scene.visualDescription || scene.scriptText || `씬 ${i + 1}`;
+      try {
+        const res = await axios.post(`${BASE}/api/generate-image`, {
+          prompt, style, ratio, model: 'dall-e',
+        }, { timeout: 90000 });
+        const { imageUrl } = res.data;
+        const imgPath = path.join(TMP_DIR, `${jobId}_img${i}.png`);
+        if (imageUrl?.startsWith('data:')) {
+          fs.writeFileSync(imgPath, Buffer.from(imageUrl.split(',')[1], 'base64'));
+        } else {
+          const buf = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 30000 });
+          fs.writeFileSync(imgPath, Buffer.from(buf.data));
+        }
+        return { ...scene, localPath: imgPath };
+      } catch (e) {
+        console.warn(`[${jobId}] 이미지 ${i + 1} 실패:`, e.message);
+        return { ...scene, localPath: null };
+      }
+    })),
+
+    // TTS 병렬 생성
+    axios.post(`${BASE}/api/tts`, {
+      text: fullScript,
+      engine: 'ElevenLabs',
+      voiceId: '21m00Tcm4TlvDq8ikWAM', // Rachel
+    }, { responseType: 'arraybuffer', timeout: 120000 })
+      .then(r => Buffer.from(r.data))
+      .catch(async (e) => {
+        console.warn(`[${jobId}] ElevenLabs 실패, Google TTS 시도:`, e.message);
+        const r = await axios.post(`${BASE}/api/tts`, {
+          text: fullScript,
+          engine: 'GoogleTTS',
+          voiceId: 'ko-KR-Wavenet-A',
+        }, { responseType: 'arraybuffer', timeout: 60000 });
+        return Buffer.from(r.data);
+      }),
+  ]);
+
+  // 로컬 파일 저장
+  const audioPath = path.join(TMP_DIR, `${jobId}_audio.mp3`);
+  fs.writeFileSync(audioPath, ttsBuffer);
+
+  const validScenes = imageResults.filter(s => s.localPath);
+  if (!validScenes.length) throw new Error('이미지 생성 실패 — 사용 가능한 클립 없음');
+
+  // ── Step 5: FFmpeg 합성 ────────────────────────────────────────
+  progress('5/5 영상 합성 중...');
+  await sendTg(chatId, `🎬 <b>Step 5/5</b> ${validScenes.length}개 씬 영상 합성 중...\n(자막 포함)`);
+
+  const [outW, outH] = ratio === '9:16' ? [1080, 1920] : [1920, 1080];
+  const scaleFilter = `scale=${outW}:${outH}:force_original_aspect_ratio=decrease,pad=${outW}:${outH}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
+
+  // 각 씬 → 영상 클립
+  const clipPaths = [];
+  for (let i = 0; i < validScenes.length; i++) {
+    const scene = validScenes[i];
+    const duration_s = scene.estimatedDuration || scene.duration || 5;
+    const fps = 25;
+    const frames = Math.round(duration_s * fps);
+    const clipPath = path.join(TMP_DIR, `${jobId}_clip${i}.mp4`);
+
+    const kenFilter = `zoompan=z='min(zoom+${(0.10 / frames).toFixed(6)},1.10)':d=${frames}:s=${outW}x${outH}:fps=${fps}`;
+    const vf = `scale=${outW * 2}:${outH * 2},${kenFilter},setsar=1`;
+
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(scene.localPath)
+        .inputOptions(['-loop 1'])
+        .outputOptions([`-t ${duration_s}`, '-c:v libx264', '-pix_fmt yuv420p', `-r ${fps}`, `-vf ${vf}`])
+        .output(clipPath)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
+    cleanup(scene.localPath);
+    clipPaths.push(clipPath);
+  }
+
+  // 클립 이어붙이기
+  const listPath = path.join(TMP_DIR, `${jobId}_list.txt`);
+  fs.writeFileSync(listPath, clipPaths.map(p => `file '${p}'`).join('\n'));
+  const concatPath = path.join(TMP_DIR, `${jobId}_concat.mp4`);
+
+  await new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(listPath)
+      .inputOptions(['-f concat', '-safe 0'])
+      .outputOptions(['-c copy'])
+      .output(concatPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+  cleanup(listPath, ...clipPaths);
+
+  // 나레이션 합성
+  const narPath = path.join(TMP_DIR, `${jobId}_nar.mp4`);
+  await new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(concatPath)
+      .input(audioPath)
+      .complexFilter('[1:a]apad[aout]')
+      .outputOptions(['-map 0:v:0', '-map [aout]', '-c:v copy', '-c:a aac', '-shortest'])
+      .output(narPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+  cleanup(concatPath, audioPath);
+
+  // 자막 burn-in
+  const assContent = generateAss(validScenes, ratio);
+  const assPath = path.join(TMP_DIR, `${jobId}.ass`);
+  fs.writeFileSync(assPath, assContent, 'utf8');
+  const finalPath = path.join(TMP_DIR, `${jobId}_final.mp4`);
+
+  await new Promise((resolve, reject) => {
+    ffmpeg(narPath)
+      .outputOptions([`-vf ass=${assPath}`, '-c:a copy'])
+      .output(finalPath)
+      .on('end', resolve)
+      .on('error', (err) => { cleanup(assPath); reject(err); })
+      .run();
+  });
+  cleanup(assPath, narPath);
+
+  jobs[jobId].resultFile = finalPath;
+  const resultUrl = `${SERVER_BASE_URL}/jobs/${jobId}/result`;
+
+  // ── 텔레그램으로 완성 영상 전송 ────────────────────────────────
+  await sendTg(chatId,
+    `✅ <b>영상 제작 완료!</b>\n\n` +
+    `📹 씬 수: ${validScenes.length}개\n` +
+    `🔗 다운로드 링크 (1시간 유효):\n${resultUrl}\n\n` +
+    `<i>영상이 너무 크면 링크에서 직접 다운로드해주세요.</i>`
+  );
+
+  // 텔레그램 sendVideo 시도 (50MB 미만 숏폼)
+  await sendTgVideo(chatId, resultUrl, '🎬 자동 제작 완성 영상');
+
+  return resultUrl;
 }
 
 // ── 작업 1: 영상 + 음성 합성 ─────────────────────────────────────
