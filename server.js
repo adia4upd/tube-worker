@@ -436,10 +436,16 @@ async function jobAutoPipeline(jobId, job) {
 
 // ── 작업 1: 영상 + 음성 합성 ─────────────────────────────────────
 async function jobMerge(jobId, job) {
-  const { videoUrl, audioUrl } = job;
+  const { videoUrl, audioUrl, audioBase64 } = job;
 
   const videoPath = await download(videoUrl, 'mp4');
-  const audioPath = await download(audioUrl, 'mp3');
+  let audioPath;
+  if (audioBase64) {
+    audioPath = path.join(TMP_DIR, `${jobId}_audio.mp3`);
+    fs.writeFileSync(audioPath, Buffer.from(audioBase64, 'base64'));
+  } else {
+    audioPath = await download(audioUrl, 'mp3');
+  }
   const outputPath = path.join(TMP_DIR, `${jobId}_merged.mp4`);
 
   await new Promise((resolve, reject) => {
