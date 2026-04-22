@@ -625,11 +625,6 @@ app.get('/', (req, res) => {
 
 // 작업 등록
 app.post('/jobs', (req, res) => {
-  const secret = req.headers['x-worker-secret'];
-  if (process.env.WORKER_SECRET && secret !== process.env.WORKER_SECRET) {
-    return res.status(401).json({ error: '인증 실패' });
-  }
-
   const jobId = uuidv4();
   const job = req.body;
 
