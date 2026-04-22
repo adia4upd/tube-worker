@@ -5,6 +5,8 @@ RUN apt-get update && apt-get install -y \
   ffmpeg \
   curl \
   fonts-noto-cjk \
+  fonts-nanum \
+  fonts-nanum-extra \
   fontconfig \
   && fc-cache -f -v \
   && rm -rf /var/lib/apt/lists/*

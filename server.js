@@ -151,6 +151,8 @@ async function processJob(jobId, job) {
       resultUrl = await jobConcat(jobId, job);
     } else if (job.type === 'auto-pipeline') {
       resultUrl = await jobAutoPipeline(jobId, job);
+    } else if (job.type === 'douyin-merge') {
+      resultUrl = await jobDouyinMerge(jobId, job);
     } else {
       throw new Error(`알 수 없는 작업 타입: ${job.type}`);
     }
@@ -434,6 +436,152 @@ async function jobAutoPipeline(jobId, job) {
   return downloadUrl;
 }
 
+// ── 도우인 자막 ASS 생성 (script 분할 + 폰트/위치 반영) ──────────
+function generateDouyinAss(script, totalSec, fontId, position) {
+  const fontMap = {
+    gmarket:      'Gmarket Sans TTF Bold',
+    nanumgothic:  'NanumGothic',
+    nanummyeongjo:'NanumMyeongjo',
+    blackhansans: 'Black Han Sans',
+    dohyeon:      'Do Hyeon',
+    jua:          'Jua',
+  };
+  const fontName = fontMap[fontId] || 'NanumGothic';
+  const playResX = 1080;
+  const playResY = 1920;
+  // ASS Alignment: 8=top-center, 5=mid-center, 2=bottom-center
+  const alignment = position === 'top' ? 8 : position === 'middle' ? 5 : 2;
+  const marginV = position === 'middle' ? 0 : Math.round(playResY * 0.12);
+
+  // 문장 단위 분할 → 30자 초과 시 쉼표 기준 재분할
+  const sentences = script.replace(/\n+/g, ' ').split(/(?<=[.!?。！？])\s*/).filter(s => s.trim());
+  const chunks = [];
+  for (const sent of sentences) {
+    const s = sent.trim();
+    if (s.length <= 30) { chunks.push(s); continue; }
+    const parts = s.split(/(?<=[,，、])\s*/);
+    let buf = '';
+    for (const p of parts) {
+      if ((buf + p).length <= 30) buf += p;
+      else { if (buf) chunks.push(buf.trim()); buf = p; }
+    }
+    if (buf.trim()) chunks.push(buf.trim());
+  }
+  if (chunks.length === 0) chunks.push(script.trim());
+
+  const totalChars = chunks.reduce((sum, c) => sum + c.length, 0) || 1;
+  const toAss = (sec) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    const cs = Math.round((sec % 1) * 100);
+    return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(cs).padStart(2,'0')}`;
+  };
+
+  let t = 0;
+  const events = chunks.map(chunk => {
+    const dur = Math.max(0.8, totalSec * (chunk.length / totalChars));
+    const lines = chunk.length > 15 ? chunk.match(/.{1,15}/g).join('\\N') : chunk;
+    const line = `Dialogue: 0,${toAss(t)},${toAss(t + dur - 0.05)},Default,,0,0,0,,${lines}`;
+    t += dur;
+    return line;
+  }).join('\n');
+
+  return `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${playResX}
+PlayResY: ${playResY}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,${fontName},68,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,${alignment},40,40,${marginV},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+${events}
+`;
+}
+
+// ── 작업: 도우인 변환 영상 합성 (영상 + TTS 오디오 + 한국어 자막 + 블러) ──
+// 입력: { videoUrl, audioBase64, font, subtitlePosition, videoFilter, script }
+async function jobDouyinMerge(jobId, job) {
+  const {
+    videoUrl, audioBase64,
+    font = 'nanumgothic',
+    subtitlePosition = 'bottom',
+    videoFilter = '',
+    script = '',
+  } = job;
+
+  if (!videoUrl) throw new Error('videoUrl 없음');
+  if (!audioBase64) throw new Error('audioBase64 없음');
+
+  const videoPath = path.join(TMP_DIR, `${jobId}_video.mp4`);
+  const videoRes = await axios.get(videoUrl, {
+    responseType: 'arraybuffer',
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    timeout: 120000,
+  });
+  fs.writeFileSync(videoPath, Buffer.from(videoRes.data));
+
+  const audioPath = path.join(TMP_DIR, `${jobId}_audio.mp3`);
+  fs.writeFileSync(audioPath, Buffer.from(audioBase64, 'base64'));
+  const audioSec = await getAudioDuration(audioPath);
+
+  // Step 1: 영상 루프 + 오디오 교체 (+ 자막영역 블러)
+  const mergedPath = path.join(TMP_DIR, `${jobId}_merged.mp4`);
+  await new Promise((resolve, reject) => {
+    const cmd = ffmpeg()
+      .input(videoPath).inputOptions(['-stream_loop -1'])
+      .input(audioPath);
+
+    if (videoFilter) {
+      // videoFilter는 [vmain]으로 끝나야 함 (finalize route에서 그렇게 구성)
+      cmd.outputOptions([
+        '-filter_complex', videoFilter,
+        '-map', '[vmain]',
+        '-map', '1:a:0',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '25',
+        '-c:a', 'aac',
+        '-shortest',
+      ]);
+    } else {
+      cmd.outputOptions([
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '25',
+        '-c:a', 'aac',
+        '-shortest',
+      ]);
+    }
+    cmd.output(mergedPath).on('end', resolve).on('error', reject).run();
+  });
+  cleanup(videoPath, audioPath);
+
+  // Step 2: 한국어 자막 burn-in
+  let outputPath = mergedPath;
+  if (script && script.trim()) {
+    const assPath = path.join(TMP_DIR, `${jobId}.ass`);
+    fs.writeFileSync(assPath, generateDouyinAss(script.trim(), audioSec, font, subtitlePosition), 'utf8');
+    const finalPath = path.join(TMP_DIR, `${jobId}_final.mp4`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(mergedPath)
+        .outputOptions([`-vf ass=${assPath}`, '-c:a copy'])
+        .output(finalPath)
+        .on('end', resolve)
+        .on('error', (err) => { cleanup(assPath); reject(err); })
+        .run();
+    });
+    cleanup(assPath, mergedPath);
+    outputPath = finalPath;
+  }
+
+  jobs[jobId].resultFile = outputPath;
+  return `${SERVER_BASE_URL}/jobs/${jobId}/result`;
+}
+
 // ── 작업 1: 영상 + 음성 합성 ─────────────────────────────────────
 async function jobMerge(jobId, job) {
   const { videoUrl, audioUrl, audioBase64 } = job;
@@ -621,6 +769,22 @@ async function jobConcat(jobId, job) {
 // 헬스체크
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'tube-worker', jobs: Object.keys(jobs).length });
+});
+
+// 도우인 변환 합성 (비동기, jobId 반환 → /douyin-merge/:jobId로 폴링)
+app.post('/douyin-merge', (req, res) => {
+  const jobId = uuidv4();
+  const job = { ...req.body, type: 'douyin-merge' };
+  jobs[jobId] = { ...job, status: 'queued', createdAt: Date.now() };
+  processJob(jobId, job).catch(console.error);
+  res.json({ jobId, status: 'queued' });
+});
+
+// 도우인 변환 상태 조회 (finalize route가 폴링)
+app.get('/douyin-merge/:jobId', (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.status(404).json({ error: '작업을 찾을 수 없음' });
+  res.json(job);
 });
 
 // 작업 등록
