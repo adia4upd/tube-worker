@@ -479,10 +479,29 @@ function generateDouyinAss(script, totalSec, fontId, position) {
     return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(cs).padStart(2,'0')}`;
   };
 
+  // 어절(공백) 기준 줄바꿈 — 한 줄 최대 15자, 최대 2줄
+  const wrapByWord = (text, maxPerLine = 15) => {
+    const words = text.split(/\s+/).filter(Boolean);
+    const lines = [];
+    let cur = '';
+    for (const w of words) {
+      const candidate = cur ? `${cur} ${w}` : w;
+      if (candidate.length <= maxPerLine) {
+        cur = candidate;
+      } else {
+        if (cur) lines.push(cur);
+        // 단일 어절이 maxPerLine을 초과하면 그 어절은 한 줄에 그대로 (자르지 않음)
+        cur = w;
+      }
+    }
+    if (cur) lines.push(cur);
+    return lines.slice(0, 2).join('\\N'); // 최대 2줄까지만 (3줄 넘으면 잘림)
+  };
+
   let t = 0;
   const events = chunks.map(chunk => {
     const dur = Math.max(0.8, totalSec * (chunk.length / totalChars));
-    const lines = chunk.length > 15 ? chunk.match(/.{1,15}/g).join('\\N') : chunk;
+    const lines = wrapByWord(chunk, 15);
     const line = `Dialogue: 0,${toAss(t)},${toAss(t + dur - 0.05)},Default,,0,0,0,,${lines}`;
     t += dur;
     return line;
