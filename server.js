@@ -9,7 +9,8 @@ const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// audioBase64(나레이션 MP3 base64)가 1~3MB 수준이라 기본 100KB 제한을 50MB로 상향.
+app.use(express.json({ limit: '50mb' }));
 
 // ── Firebase Admin 초기화 ─────────────────────────────────────────
 let firebaseAdmin = null;
